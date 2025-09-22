@@ -3,6 +3,7 @@ import os
 import uproot
 from coffea import processor
 from coffea.analysis_tools import Weights
+import correctionlib
 import vector
 vector.register_awkward()
 
@@ -95,7 +96,7 @@ class NanoProcessor(processor.ProcessorABC):
         met_filter = np.ones(len(events), dtype="bool")
         if isRealData:
             req_lumi = self.lumiMask(events.run, events.luminosityBlock)
-            met_filter = MET_filters(events, campaign)
+            met_filter = MET_filters(events, self._campaign)
         # only dump for nominal case
         if shift_name is None:
             output = dump_lumi(events[req_lumi], output)
@@ -143,7 +144,7 @@ class NanoProcessor(processor.ProcessorABC):
                      '320': {'ptmin': 320, 'ptmax': 9999999, 'trigger': 'BTagMu_AK4Jet300_Mu5',   'req': 1, 'req_matching': 1}}
         # Build selection mask
         masks = []
-
+        trigbools = {}
         for bin_key, cfg in pt_matrix.items():
             # select jets in this pt range
             jets_in_bin  = (event_jet.pt >= cfg['ptmin']) & (event_jet.pt < cfg['ptmax'])
@@ -155,6 +156,7 @@ class NanoProcessor(processor.ProcessorABC):
 
             # build event mask: trigger fired AND enough jets
             mask = (events.HLT[cfg['trigger']]) & (n_jets_in_bin >= cfg['req']) & (n_mjets_in_bin >= cfg['req_matching'])
+            trigbools[cfg['trigger']] = HLT_helper(events, [cfg['trigger']])
             masks.append(mask)
         
         trigger_pt_mask_selection = np.logical_or.reduce(masks)
@@ -197,6 +199,29 @@ class NanoProcessor(processor.ProcessorABC):
         ####################
         # Configure SFs - read pruned objects from the pruned_ev and apply SFs and call the systematics
         weights = weight_manager(pruned_ev, self.SF_map, self.isSyst)
+        if isRealData:
+            if self._year == "2022":
+                run_num = "355374_362760"
+            elif self._year == "2023":
+                run_num = "366727_370790"
+            elif self._year == "2024":
+                run_num = "378985_386951"    
+
+            psweight = np.zeros(len(pruned_ev))
+            for trigger, trigbool in trigbools.items():
+                psfile = f"src/BTVNanoCommissioning/data/Prescales/ps_weight_{trigger}_run{run_num}.json"
+                if not os.path.isfile(psfile):
+                    raise NotImplementedError(
+                        f"Prescale weights not available for {trigger} in {self._year}. Please run `scripts/dump_prescale.py`."
+                    )
+                pseval = correctionlib.CorrectionSet.from_file(psfile)
+                thispsweight = pseval["prescaleWeight"].evaluate(
+                    pruned_ev.run,
+                    f"HLT_{trigger}",
+                    ak.values_astype(pruned_ev.luminosityBlock, np.float32),
+                )
+                psweight = ak.where(trigbool[event_level], thispsweight, psweight)
+            weights.add("psweight", psweight)
         # Configure systematics shifts
         if shift_name is None:
             systematics = ["nominal"] + list(
@@ -208,10 +233,10 @@ class NanoProcessor(processor.ProcessorABC):
         # Fill the weight to output arrys
 
         # Configure histograms- fill the histograms with pruned objects
-        if not self.noHist:
-            output = histo_writter(
-                pruned_ev, output, weights, systematics, self.isSyst, self.SF_map
-            )
+        #if not self.noHist:
+        #    output = histo_writter(
+        #        pruned_ev, output, weights, systematics, self.isSyst, self.SF_map
+        #    )
         # Output arrays - store the pruned objects in the output arrays
         if self.isArray:
             array_writer(
