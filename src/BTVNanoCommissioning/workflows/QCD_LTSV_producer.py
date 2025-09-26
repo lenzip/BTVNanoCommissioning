@@ -1,6 +1,7 @@
 import collections, awkward as ak, numpy as np
 import os
 import uproot
+import hist
 from coffea import processor
 from coffea.analysis_tools import Weights
 import correctionlib
@@ -35,6 +36,76 @@ from BTVNanoCommissioning.utils.selection import (
 )
 
 
+# =====================================================
+# 1) Histogram axes definition
+# =====================================================
+HISTOGRAM_AXES = {
+    "sys_axis": hist.axis.StrCategory([], name="syst", growth=True),
+    "njet_axis": hist.axis.Integer(0, 10, name="njet", label="N jets"),
+    "pt_axis": hist.axis.Regular(50, 0, 300, name="pt", label=r"$p_T$ [GeV]"),
+    "eta_axis": hist.axis.Regular(25, -2.5, 2.5, name="eta", label=r"$\eta$"),
+}
+
+
+# =====================================================
+# 2) Define histograms
+# =====================================================
+def define_histograms():
+    histograms = {
+        "njet": hist.Hist(
+            HISTOGRAM_AXES["sys_axis"],
+            HISTOGRAM_AXES["njet_axis"],
+            hist.storage.Weight(),
+        ),
+        "jet_pt": hist.Hist(
+            HISTOGRAM_AXES["sys_axis"],
+            HISTOGRAM_AXES["pt_axis"],
+            hist.storage.Weight(),
+        ),
+        "jet_eta": hist.Hist(
+            HISTOGRAM_AXES["sys_axis"],
+            HISTOGRAM_AXES["eta_axis"],
+            hist.storage.Weight(),
+        ),
+    }
+    return histograms
+
+# =====================================================
+# 3) Fill histograms
+# =====================================================
+def fill_histograms(histograms, pruned_ev, weights, systematics, isSyst):
+    for syst in systematics:
+        if not isSyst and syst != "nominal":
+            break
+
+        weight = (
+            weights.weight()
+            if syst == "nominal" or syst not in list(weights.variations)
+            else weights.weight(modifier=syst)
+        )
+
+        # number of jets
+        histograms["njet"].fill(
+            syst=syst,
+            njet=pruned_ev.njet,
+            weight=weight,
+        )
+
+        # pT and eta of selected jets
+        histograms["jet_pt"].fill(
+            syst=syst,
+            pt=pruned_ev.SelJet.pt,
+            weight=weight,
+        )
+        histograms["jet_eta"].fill(
+            syst=syst,
+            eta=pruned_ev.SelJet.eta,
+            weight=weight,
+        )
+    return histograms
+
+
+
 class NanoProcessor(processor.ProcessorABC):
     def __init__(
         self,
@@ -56,6 +127,7 @@ class NanoProcessor(processor.ProcessorABC):
         self.chunksize = chunksize
         ## Load corrections
         self.SF_map = load_SF(self._year, self._campaign)
+
 
     @property
     def accumulator(self):
@@ -198,6 +270,7 @@ class NanoProcessor(processor.ProcessorABC):
         #     Output       #
         ####################
         # Configure SFs - read pruned objects from the pruned_ev and apply SFs and call the systematics
+        #logger.debug("setting up weight_manager")
         weights = weight_manager(pruned_ev, self.SF_map, self.isSyst)
         if isRealData:
             if self._year == "2022":
@@ -237,6 +310,23 @@ class NanoProcessor(processor.ProcessorABC):
         #    output = histo_writter(
         #        pruned_ev, output, weights, systematics, self.isSyst, self.SF_map
         #    )
+
+        # ===============
+        # fill histograms
+        # ===============
+        if not self.noHist:
+            histograms = define_histograms()  # create histograms
+            histograms = fill_histograms(
+                histograms=histograms,
+                pruned_ev=pruned_ev,
+                weights=weights,
+                systematics=systematics,
+                isSyst=self.isSyst
+            )
+            output.update(histograms)  # add histograms to output
+
+
+
         # Output arrays - store the pruned objects in the output arrays
         if self.isArray:
             array_writer(
