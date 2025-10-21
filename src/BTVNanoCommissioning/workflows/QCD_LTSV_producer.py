@@ -6,7 +6,6 @@ from coffea import processor
 from coffea.analysis_tools import Weights
 import correctionlib
 import vector
-vector.register_awkward()
 
 # functions to load SFs, corrections
 from BTVNanoCommissioning.utils.correction import (
@@ -26,54 +25,83 @@ from BTVNanoCommissioning.helpers.func import (
 from BTVNanoCommissioning.helpers.update_branch import missing_branch
 
 ## load histograms & selctions for this workflow
-from BTVNanoCommissioning.utils.histogrammer import histogrammer, histo_writter
+#from BTVNanoCommissioning.utils.histogrammer import histogrammer, histo_writter
 from BTVNanoCommissioning.utils.array_writer import array_writer
 from BTVNanoCommissioning.utils.selection import (
     HLT_helper,
     jet_id,
     mu_idiso,
-    MET_filters
+    MET_filters,
+    btag_wp_dict,
 )
 
-
-# =====================================================
-# 1) Histogram axes definition
-# =====================================================
+# Histogram axes definition
+CHANNELS = ["incl"]
 HISTOGRAM_AXES = {
+    "flav_axis": hist.axis.IntCategory([0, 1, 4, 5, 6], name="flav", label="Flavor"),
     "sys_axis": hist.axis.StrCategory([], name="syst", growth=True),
     "njet_axis": hist.axis.Integer(0, 10, name="njet", label="N jets"),
-    "pt_axis": hist.axis.Regular(50, 0, 300, name="pt", label=r"$p_T$ [GeV]"),
-    "eta_axis": hist.axis.Regular(25, -2.5, 2.5, name="eta", label=r"$\eta$"),
+    "dr_axis": hist.axis.Regular(20, 0, 8, name="dr", label="$\Delta$R"),
+    "pt_axis": hist.axis.Regular(50, 0, 300, name="pt", label=r"$p_{\mathrm{T}}$ / GeV"),
+    "ptbin_axis": hist.axis.StrCategory([], name="ptbin", label=r"$p_\mathrm{T}$ bin", growth=True),
+    "pt_btag_axis": hist.axis.Variable([*range(0, 200, 10), 200, np.inf], name="pt", label=r"$p_{\mathrm{T}}$ / GeV"),
+    "mass_axis": hist.axis.Regular(50, 0, 300, name="mass", label="$m$ / GeV"),
+    "eta_axis": hist.axis.Regular(25, -2.5, 2.5, name="eta", label="$\eta$"),
+    "abs_eta_axis": hist.axis.Variable([0.0, 0.8, 1.6, 2.5], name="eta", label="|$\eta$|"),
+    "phi_axis": hist.axis.Regular(30, -3, 3, name="phi", label="$\phi$"),
+    "Proba_axis": hist.axis.Regular(20, 0, 2, name="Proba", label="JP"),
+    "DeepJet_sv_mass_0_axis": hist.axis.Regular(20, 0, 10, name="DeepJet_sv_mass_0", label=r"$m_\mathrm{SV}$ / GeV"),
 }
 
 
-# =====================================================
-# 2) Define histograms
-# =====================================================
-def define_histograms():
+# Define histograms
+def define_histograms(
+    particle_objects: dict[str, list],
+    tagger_list: list,
+):
     histograms = {
-        "njet": hist.Hist(
-            HISTOGRAM_AXES["sys_axis"],
-            HISTOGRAM_AXES["njet_axis"],
-            hist.storage.Weight(),
-        ),
-        "jet_pt": hist.Hist(
-            HISTOGRAM_AXES["sys_axis"],
-            HISTOGRAM_AXES["pt_axis"],
-            hist.storage.Weight(),
-        ),
-        "jet_eta": hist.Hist(
-            HISTOGRAM_AXES["sys_axis"],
-            HISTOGRAM_AXES["eta_axis"],
-            hist.storage.Weight(),
-        ),
+        "njet": hist.Hist(HISTOGRAM_AXES["sys_axis"], HISTOGRAM_AXES["njet_axis"], hist.storage.Weight()),
+        "dr_jets": hist.Hist(HISTOGRAM_AXES["sys_axis"], HISTOGRAM_AXES["dr_axis"], hist.storage.Weight()),
     }
+
+    for obj, attrs in particle_objects.items():
+        for attr in attrs:
+            if obj == "SelJet":
+                for tagger in tagger_list:
+                    # syst, flav, ptbin, attr
+                    HISTOGRAM_AXES[f"{tagger}_btagwp_axis"] = hist.axis.IntCategory([0, 1, 2, 3, 4, 5], name=f"{tagger}_btagwp", label=f"{tagger} WP passed")
+                    histograms[f"{obj}_{tagger}_{attr}"] = hist.Hist(
+                        HISTOGRAM_AXES["sys_axis"],
+                        HISTOGRAM_AXES["flav_axis"],
+                        HISTOGRAM_AXES["ptbin_axis"],
+                        HISTOGRAM_AXES[f"{attr}_axis"],
+                        HISTOGRAM_AXES[f"{tagger}_btagwp_axis"],
+                        hist.storage.Weight(),
+                    )
+            else:
+                histograms[f"{obj}_{attr}"] = hist.Hist(
+                    HISTOGRAM_AXES["sys_axis"],
+                    HISTOGRAM_AXES[f"{attr}_axis"],
+                    hist.storage.Weight(),
+                )
+
+
     return histograms
 
-# =====================================================
-# 3) Fill histograms
-# =====================================================
-def fill_histograms(histograms, pruned_ev, weights, systematics, isSyst):
+# Fill histograms
+def fill_histograms(
+    histograms,
+    pruned_ev,
+    particle_objects: dict[str, list],
+    jetPtBins,
+    weights,
+    systematics: list,
+    isSyst: bool,
+    tagger_list: list,
+    btag_wps: dict,
+    year,
+    campaign,
+):
     for syst in systematics:
         if not isSyst and syst != "nominal":
             break
@@ -84,27 +112,68 @@ def fill_histograms(histograms, pruned_ev, weights, systematics, isSyst):
             else weights.weight(modifier=syst)
         )
 
-        # number of jets
-        histograms["njet"].fill(
-            syst=syst,
-            njet=pruned_ev.njet,
-            weight=weight,
-        )
+        # Global jet histograms
+        histograms["njet"].fill(syst=syst, njet=pruned_ev.njet, weight=weight)
+        
+        
+        # Object histograms
+        for obj, attrs in particle_objects.items():
+            for attr in attrs:
+                parts = obj.split("#", 1)
+                _obj = parts[0]
+                if len(parts) > 1:
+                    index = int(parts[1])
+                    attr_value = getattr(pruned_ev[_obj][:, index], attr)
+                else:
+                    attr_value = getattr(pruned_ev[_obj], attr)
 
-        # pT and eta of selected jets
-        histograms["jet_pt"].fill(
-            syst=syst,
-            pt=pruned_ev.SelJet.pt,
-            weight=weight,
-        )
-        histograms["jet_eta"].fill(
-            syst=syst,
-            eta=pruned_ev.SelJet.eta,
-            weight=weight,
-        )
+
+                # flatten if needed
+                if attr_value.ndim > 1:
+                    weight_flat, attr_value_flat = broadcast_and_flatten(weight, attr_value)
+                else:
+                    weight_flat = weight
+                    attr_value_flat = attr_value
+
+
+                if obj == "SelJet":
+                    flav_flat = ak.flatten(pruned_ev.SelJet.flav, axis=None)
+                    jet_pt = pruned_ev.SelJet.pt
+                    
+                    # Build pt bins
+                    ptbins = ak.Array(["undefined"] * len(jet_pt))
+                    for name, info in jetPtBins.items():
+                        low, high = info["jetPtRange"]
+                        mask = (jet_pt >= low) & (jet_pt < high)
+                        ptbins = ak.where(mask, name, ptbins)
+                    # Flatten pt bins
+                    ptbins_flat = ak.to_list(ptbins)
+
+
+                    for tagger in tagger_list: 
+                        bdisc = getattr(pruned_ev.SelJet, f"btag{tagger}B")  # per ora con b vs all
+                        wps = btag_wps[tagger]["b"]
+
+                        
+                        pass_wp_idx = ak.zeros_like(bdisc, dtype=int)
+                        for wp_name, wp_thr in wps.items():
+                            if wp_name == "No":
+                                continue
+                            pass_wp_idx = pass_wp_idx + ak.values_astype(bdisc > float(wp_thr), int)
+
+                        histograms[f"{obj}_{tagger}_{attr}"].fill(
+                            syst=syst,
+                            ptbin=ptbins_flat,
+                            **{attr: attr_value_flat},
+                            flav=flav_flat,
+                            **{f"{tagger}_btagwp": pass_wp_idx},
+                            weight=weight_flat,
+                        )
+                else:
+                    histograms[f"{obj}_{attr}"].fill(**{attr: attr_value_flat, "weight": weight_flat, "syst": syst})
+
+
     return histograms
-
-
 
 class NanoProcessor(processor.ProcessorABC):
     def __init__(
@@ -125,9 +194,31 @@ class NanoProcessor(processor.ProcessorABC):
         self.noHist = noHist
         self.lumiMask = load_lumi(self._campaign)
         self.chunksize = chunksize
+
         ## Load corrections
         self.SF_map = load_SF(self._year, self._campaign)
 
+        # WP per tagger
+        self.btag_wps = btag_wp_dict[self._year + "_" + self._campaign] 
+
+
+        # pt bins for SF calculation
+        ptbins = [20, 30, 50, 70, 100, 140, 200, 300, 600, 1000]
+        self.jetPtBins = collections.OrderedDict()
+        for i in range(len(ptbins) - 1):
+            low = ptbins[i]
+            high = ptbins[i + 1]
+            name = f"Pt{low}to{high}"
+            self.jetPtBins[name] = {}
+            self.jetPtBins[name]["jetPtRange"] = [float(low), float(high)]
+        
+
+
+        self.particle_objects = {
+            "SelJet": ["pt", "eta", "phi", "mass", "DeepJet_sv_mass_0"],
+            "SelMuon": ["pt", "eta", "phi"],  
+            "PuppiMET": ["pt", "phi"],        
+        }
 
     @property
     def accumulator(self):
@@ -152,7 +243,8 @@ class NanoProcessor(processor.ProcessorABC):
         #  Create histogram  # : Get the histogram dict from `histogrammer`
         ######################
         # this is the place to modify
-        output = {} if self.noHist else histogrammer(events, "example")
+        #output = {} if self.noHist else histogrammer(events, "example")
+        output = {}
 
         if shift_name is None:
             if isRealData:
@@ -261,9 +353,54 @@ class NanoProcessor(processor.ProcessorABC):
         ####################
         # Keep the structure of events and pruned the object size
         pruned_ev = events[event_level]
-        pruned_ev["SelJet"] = matching_jets[event_level][:, 0]
+        #print(pruned_ev.fields)
+ 
+        # Leading matched jet
+        if ak.any(ak.num(matching_jets[event_level]) > 0):
+            leading_jet = matching_jets[event_level][:, 0]
+            pruned_ev["SelJet"] = leading_jet
+            # print(leading_jet.fields)
+
+            # Flavour tagging
+            if "hadronFlavour" in leading_jet.fields:
+                isRealData = False
+                genflavor = ak.values_astype(
+                    leading_jet.hadronFlavour
+                    + 1 * (
+                        (leading_jet.partonFlavour == 0)
+                        & (leading_jet.hadronFlavour == 0)
+                    ),
+                    int,
+                )
+                if "MuonJet" in pruned_ev.fields:
+                    smflav = ak.values_astype(
+                        1 * (
+                            (pruned_ev.MuonJet.partonFlavour == 0)
+                            & (pruned_ev.MuonJet.hadronFlavour == 0)
+                        ) + pruned_ev.MuonJet.hadronFlavour,
+                        int,
+                    )
+            else:
+                isRealData = True
+                genflavor = ak.zeros_like(leading_jet.pt, dtype=int)
+                if "MuonJet" in pruned_ev.fields:
+                    smflav = ak.zeros_like(pruned_ev.MuonJet.pt, dtype=int)
+
+            pruned_ev["SelJet"] = ak.with_field(pruned_ev["SelJet"], genflavor, "flav")
+
+
+        # Leading muon
+        if ak.any(ak.num(event_mu[event_level]) > 0):
+            pruned_ev["SelMuon"] = event_mu[event_level][:, 0]
+
+        # PuppiMET 
+        pruned_ev["PuppiMET"] = events.PuppiMET[event_level]
+
+        # Number of jets
         pruned_ev['njet'] = ak.num(matching_jets[event_level])
+
         print(f'passed {len(pruned_ev)}')
+        
 
         ## <========= end: store custom objects
         ####################
@@ -311,20 +448,27 @@ class NanoProcessor(processor.ProcessorABC):
         #        pruned_ev, output, weights, systematics, self.isSyst, self.SF_map
         #    )
 
-        # ===============
-        # fill histograms
-        # ===============
-        if not self.noHist:
-            histograms = define_histograms()  # create histograms
-            histograms = fill_histograms(
-                histograms=histograms,
-                pruned_ev=pruned_ev,
-                weights=weights,
-                systematics=systematics,
-                isSyst=self.isSyst
-            )
-            output.update(histograms)  # add histograms to output
+        # Fill histograms 
 
+        histograms = define_histograms(
+            particle_objects=self.particle_objects,
+            tagger_list=self.btag_wps.keys(),
+        )
+
+        histograms = fill_histograms(
+            histograms=histograms,
+            pruned_ev=pruned_ev,
+            particle_objects=self.particle_objects,
+            jetPtBins=self.jetPtBins,
+            weights=weights,
+            systematics=systematics,
+            isSyst=self.isSyst,
+            tagger_list=self.btag_wps.keys(),
+            btag_wps=self.btag_wps, 
+            year=self._year,
+            campaign=self._campaign,
+        )
+        output.update(histograms)
 
 
         # Output arrays - store the pruned objects in the output arrays
