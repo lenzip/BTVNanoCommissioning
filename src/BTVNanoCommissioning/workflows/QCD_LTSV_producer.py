@@ -215,7 +215,7 @@ class NanoProcessor(processor.ProcessorABC):
 
 
         self.particle_objects = {
-            "SelJet": ["pt", "eta", "phi", "mass", "DeepJet_sv_mass_0"],
+            "SelJet": ["pt", "eta", "phi", "mass", "DeepJet_sv_mass_0", "Proba"],
             "SelMuon": ["pt", "eta", "phi"],  
             "PuppiMET": ["pt", "phi"],        
         }
