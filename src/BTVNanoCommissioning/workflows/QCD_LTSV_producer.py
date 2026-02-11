@@ -7,6 +7,9 @@ from coffea.analysis_tools import Weights
 import correctionlib
 import vector
 
+from coffea.lookup_tools import extractor
+from BTVNanoCommissioning.helpers.BTA_helper import get_hadron_mass
+
 # functions to load SFs, corrections
 from BTVNanoCommissioning.utils.correction import (
     load_lumi,
@@ -175,6 +178,406 @@ def fill_histograms(
 
     return histograms
 
+
+def get_gluonsplitting_weight_from_lastB(lastBHadron, template):
+    """
+    Gluon splitting (g->bb) weight based on the number of last-B hadrons in the jet.
+
+    If n_lastB >= 2:
+      - up   = 1.5
+      - down = 0.5
+    else:
+      - up = down = 1.0
+
+    Parameters
+    ----------
+    lastBHadron : awkward.Array
+        Collection of last B hadrons matched to the jet (per event).
+    template : awkward.Array
+        Any event-level array used only to build output shapes (e.g. SelJet.pt).
+
+    Returns
+    -------
+    (nominal, up, down) : awkward.Arrays
+        Event-level weights.
+    """
+    n_lastB = ak.num(lastBHadron)
+
+    nominal = ak.full_like(template, 1.0, dtype=float)
+    up      = ak.where(n_lastB >= 2, 1.5, 1.0)
+    down    = ak.where(n_lastB >= 2, 0.5, 1.0)
+
+    return (
+        ak.values_astype(nominal, float),
+        ak.values_astype(up, float),
+        ak.values_astype(down, float),
+    )
+
+def get_bfragmentation_weight(xB, genJetPt, shift=False):
+    """
+    Compute b-hadron fragmentation weights and their systematic variations.
+
+    Parameters
+    ----------
+    xB : awkward.Array
+        Fraction of the jet transverse momentum carried by the leading B hadron.
+    genJetPt : awkward.Array
+        Transverse momentum of the matched generator-level jet.
+    shift : bool
+        If True, return absolute weights (nominal, up, down).
+        If False, return relative variations (1, up/nominal, down/nominal).
+
+    Returns
+    -------
+    tuple of awkward.Array
+        Nominal, up, and down weights (or relative variations).
+    """
+    ext = extractor()
+    ext.add_weight_sets(["* * src/BTVNanoCommissioning/data/BFragmentation/bfragweights_vs_pt.root"])
+    ext.finalize()
+
+    passJet = ak.all(xB < 1) & ak.all(genJetPt >= 30)
+    failJet = ak.full_like(xB, 1) - passJet
+
+    bfragweight     = ak.values_astype(passJet * (ext.make_evaluator()["fragCP5BL"](xB, genJetPt))     + failJet, float)
+    bfragweightUp   = ak.values_astype(passJet * (ext.make_evaluator()["fragCP5BLup"](xB, genJetPt))   + failJet, float)
+    bfragweightDown = ak.values_astype(passJet * (ext.make_evaluator()["fragCP5BLdown"](xB, genJetPt)) + failJet, float)
+
+    if shift:
+        # Return absolute weights
+        return bfragweight, bfragweightUp, bfragweightDown
+    else:
+        # Return nominal + relative variations
+        return ak.full_like(xB, 1.0), bfragweightUp / bfragweight, bfragweightDown / bfragweight
+
+def get_decay_weight(bHadronId, shift=False):
+    """
+    Compute B-hadron decay (semi-leptonic BR) weights and systematic variations.
+    """
+    # https://github.com/scodella/BTVNanoCommissioning/blob/008d9b7b17252aa56a6519a180d6775d7d15d37d/src/BTVNanoCommissioning/workflows/pTrel.py#L187
+    
+    # (constant variations)
+    bdecayweight     = ak.full_like(bHadronId, 1.0, dtype=float)
+    bdecayweightUp   = ak.full_like(bHadronId, 1.1, dtype=float)
+    bdecayweightDown = ak.full_like(bHadronId, 0.9, dtype=float)
+
+    if shift:
+        # Return absolute weights
+        return bdecayweight, bdecayweightUp, bdecayweightDown
+    else:
+        # Return nominal + relative variations
+        return (
+            ak.full_like(bHadronId, 1.0, dtype=float),
+            bdecayweightUp / bdecayweight,
+            bdecayweightDown / bdecayweight,
+        )
+
+def get_cfragmentation_weight(genpart, seljet, dr=0.4):
+    """
+    c-fragmentation systematic
+
+    Event-by-event logic:
+      - consider only charm jets (SelJet.flav == 4)
+      - require at least one c-quark within dR < dr from the selected jet
+      - select charm hadrons (PDG family 4xx / 4xxx, isLastCopy) within dR < dr
+      - if the jet contains:
+          D+  (PDG 411) -> Down *= 1.37
+          D0  (PDG 421) -> Down *= 0.91
+          Ds  (PDG 431) -> Down *= 0.67
+      - Up variation is defined as the inverse of Down: Up = 1 / Down
+
+    Returns
+    -------
+    (nominal, up, down) : awkward.Arrays
+        Event-level weights.
+    """
+
+    if genpart is None or seljet is None:
+        base = seljet.pt if (seljet is not None and hasattr(seljet, "pt")) else ak.Array([])
+        ones = ak.full_like(base, 1.0, dtype=float)
+        return ones, ones, ones
+
+    # Identify charm jets (hadron flavour == 4)
+    if hasattr(seljet, "flav"):
+        is_cjet = abs(seljet.flav) == 4
+    else:
+        # Fallback: if flavour is not available, apply to all jets
+        is_cjet = ak.ones_like(seljet.pt, dtype=bool)
+
+    # GenPart information
+    abs_pdg = abs(genpart.pdgId)
+
+    # Distance matrix GenPart <-> SelJet
+    # Shape: (events, nGenPart, nSelJet=1)
+    drs = genpart.metric_table(seljet)
+    close_to_jet = drs < dr
+
+    # Require a c-quark inside the jet (|pdgId| == 4)
+    cquark_mask = (abs_pdg == 4) & ak.all(close_to_jet, axis=2)
+    has_cquark = ak.num(genpart[cquark_mask]) > 0
+
+    # Select charm hadrons (PDG family 4xx / 4xxx), last copy, in the jet
+    is_charm_hadron = ((abs_pdg // 100) == 4) | ((abs_pdg // 1000) == 4)
+
+    try:
+        is_last = genpart.hasFlags("isLastCopy")
+    except Exception:
+        # Fallback if hasFlags is not available
+        is_last = ak.ones_like(genpart.pdgId, dtype=bool)
+
+    charm_hadrons = genpart[
+        is_charm_hadron & is_last & ak.all(close_to_jet, axis=2)
+    ]
+
+    abs_ch = abs(charm_hadrons.pdgId)
+
+    has_Dplus = ak.any(abs_ch == 411, axis=-1)
+    has_Dzero = ak.any(abs_ch == 421, axis=-1)
+    has_Dsubs = ak.any(abs_ch == 431, axis=-1)
+
+    # Build event-level weights
+    nominal = ak.full_like(seljet.pt, 1.0, dtype=float)
+    down = ak.full_like(seljet.pt, 1.0, dtype=float)
+
+    valid = is_cjet & has_cquark
+
+    down = ak.where(valid & has_Dplus, down * 1.37, down)
+    down = ak.where(valid & has_Dzero, down * 0.91, down)
+    down = ak.where(valid & has_Dsubs, down * 0.67, down)
+
+    # Up variation defined as inverse of Down (protect against zero)
+    safe_down = ak.where(down == 0.0, ak.ones_like(down), down)
+    up = 1.0 / safe_down
+
+    return (
+        ak.values_astype(nominal, float),
+        ak.values_astype(up, float),
+        ak.values_astype(down, float),
+    )
+
+def get_cdfragmentation_weight(genpart, seljet, dr=0.4, max_steps=15):
+    """
+    Semi-muonic charm-hadron fragmentation/decay systematic.
+
+    Event-level logic:
+      - applied only to b or c jets
+      - select D hadrons (411, 421, 431) inside the jet (ΔR < dr)
+      - tag a D hadron as semimuonic if a muon descends from it
+        (using the GenPart mother chain)
+      - apply PDG-based branching-ratio factors to the Down variation
+      - Up variation is kept equal to 1
+
+    Returns
+    -------
+    (nominal, up, down) : awkward.Arrays
+        Event-level weights.
+    """
+
+    # Safety: return unity weights if inputs are missing
+    if genpart is None or seljet is None:
+        base = seljet.pt if (seljet is not None and hasattr(seljet, "pt")) else ak.Array([])
+        ones = ak.full_like(base, 1.0, dtype=float)
+        return ones, ones, ones
+
+    # Require flavour information to identify b/c jets
+    if hasattr(seljet, "flav"):
+        flav = np.abs(seljet.flav)
+        is_bcjet = (flav == 4) | (flav == 5)
+    else:
+        is_bcjet = ak.zeros_like(seljet.pt, dtype=bool)
+
+    # Distance GenPart <-> selected jet
+    close_to_jet = ak.all(genpart.metric_table(seljet) < dr, axis=2)
+
+    abs_pdg = np.abs(genpart.pdgId)
+
+    # Select D hadrons inside the jet
+    is_D = (abs_pdg == 411) | (abs_pdg == 421) | (abs_pdg == 431)
+    D_in_jet = is_D & close_to_jet
+
+    # Local GenPart indices
+    gp_idx = ak.local_index(genpart.pdgId, axis=1)
+    D_idx = gp_idx[D_in_jet]
+
+    has_D = ak.num(D_idx) > 0
+
+    # Select muons
+    is_mu = abs_pdg == 13
+    mu_idx = gp_idx[is_mu]
+    has_mu = ak.num(mu_idx) > 0
+
+    mother = genpart.genPartIdxMother
+
+    # Track whether a muon descends from a D hadron of a given species
+    anc = mu_idx
+    from_Dplus = ak.zeros_like(mu_idx, dtype=bool)
+    from_Dzero = ak.zeros_like(mu_idx, dtype=bool)
+    from_Dsubs = ak.zeros_like(mu_idx, dtype=bool)
+
+    D_abs = np.abs(genpart.pdgId[D_idx])
+
+    # Helper: check if a muon ancestor index matches ANY D_in_jet index in the same event
+    for _ in range(max_steps):
+        mom = mother[anc] 
+        valid = mom >= 0 #valid mi dice dove mom != -1
+        if not ak.any(valid):
+            break
+
+        # Compare mom indices with D indices in jet: (event, nMu, nD)
+        # matches[event, iMu, iD] = (mom_idx == D_idx_in_jet)
+        matches = (mom[..., None] == D_idx[:, None, :]) 
+
+        from_Dplus |= ak.any(matches & (D_abs[:, None, :] == 411), axis=2)
+        from_Dzero |= ak.any(matches & (D_abs[:, None, :] == 421), axis=2)
+        from_Dsubs |= ak.any(matches & (D_abs[:, None, :] == 431), axis=2)
+
+        anc = ak.where(valid, mom, anc) # where valid == True, anc is updated with mom
+
+    has_DplusMu = ak.any(from_Dplus, axis=1)
+    has_DzeroMu = ak.any(from_Dzero, axis=1)
+    has_DsubsMu = ak.any(from_Dsubs, axis=1)
+
+    # Build weights
+    nominal = ak.full_like(seljet.pt, 1.0, dtype=float)
+    up      = ak.full_like(seljet.pt, 1.0, dtype=float)
+    down    = ak.full_like(seljet.pt, 1.0, dtype=float)
+
+    valid_evt = is_bcjet & has_D & has_mu
+
+    down = ak.where(valid_evt & has_DplusMu, down * (0.176 / 0.172), down)
+    down = ak.where(valid_evt & has_DzeroMu, down * (0.067 / 0.077), down)
+    down = ak.where(valid_evt & has_DsubsMu, down * (0.067 / 0.080), down)
+
+    safe_down = ak.where(down == 0.0, ak.ones_like(down), down)
+    up = 1.0 / safe_down
+
+    return (
+        ak.values_astype(nominal, float),
+        ak.values_astype(up, float),
+        ak.values_astype(down, float),
+    )
+
+def get_cdfragmentation_simple_weight(genpart, seljet, dr=0.4):
+    """
+    Simplified c->D (D->mu) systematic (no ancestry check).
+
+    Event-by-event logic:
+      - apply only to b- or c-jets, if available
+      - require at least one charm hadron (D+, D0, Ds) within dR < dr of the selected jet
+      - require at least one muon (pdgId==13) within dR < dr of the selected jet
+      - if both conditions are met:
+          D+  -> Down *= 0.176 / 0.172
+          D0  -> Down *= 0.067 / 0.077
+          Ds  -> Down *= 0.067 / 0.080
+      - Up is defined as the inverse of Down: Up = 1 / Down
+      - Nominal is 1
+
+    Returns
+    -------
+    (nominal, up, down) : awkward.Arrays
+        Event-level weights.
+    """
+
+    # Base output (event-level)
+    ones = ak.full_like(seljet.pt, 1.0, dtype=float)
+    nominal = ones
+    down = ones
+
+    if genpart is None or seljet is None:
+        return nominal, nominal, down
+
+    # Apply only to b/c jets if flavour is available; otherwise apply to all events
+    if hasattr(seljet, "flav"):
+        flav = np.abs(seljet.flav)
+        is_bcjet = (flav == 4) | (flav == 5)
+    else:
+        is_bcjet = ak.ones_like(seljet.pt, dtype=bool)
+
+    abs_pdg = np.abs(genpart.pdgId)
+
+    # Distance GenPart <-> SelJet (SelJet is 1 jet per event)
+    drs = genpart.metric_table(seljet)          # (evt, nGenPart, 1)
+    in_jet = ak.all(drs < dr, axis=2)           # (evt, nGenPart)
+
+    # D species inside the jet
+    has_Dplus = ak.any(in_jet & (abs_pdg == 411), axis=1)
+    has_Dzero = ak.any(in_jet & (abs_pdg == 421), axis=1)
+    has_Dsubs = ak.any(in_jet & (abs_pdg == 431), axis=1)
+
+    has_D = has_Dplus | has_Dzero | has_Dsubs
+
+    # Muon inside the jet (no ancestry requirement)
+    has_mu_in_jet = ak.any(in_jet & (abs_pdg == 13), axis=1)
+
+    valid = is_bcjet & has_D & has_mu_in_jet
+
+    # Apply the same Down factors as the C++ code (multiplicative)
+    down = ak.where(valid & has_Dplus, down * (0.176 / 0.172), down)
+    down = ak.where(valid & has_Dzero, down * (0.067 / 0.077), down)
+    down = ak.where(valid & has_Dsubs, down * (0.067 / 0.080), down)
+
+    # Up = inverse of Down
+    safe_down = ak.where(down == 0.0, ak.ones_like(down), down)
+    up = 1.0 / safe_down
+
+    return nominal, up, down
+
+
+def get_v0_weight(genpart, seljet, dr=0.3):
+    """
+    V0 (K0s/Lambda) systematic using GenPart.
+
+    Event-level logic:
+      - apply only to light jets
+      - select GenPart with PDG 310 (K0s) or 3122 (Lambda)
+      - require ΔR < dr to selected jet
+      - Up   *= 1.3 if at least one K0s
+      - Up   *= 1.5 if at least one Lambda
+      - Down = 1 / Up  (symmetrized variation)
+
+    Returns
+    -------
+    (nominal, up, down) : awkward.Arrays
+        Event-level weights.
+    """
+
+    if genpart is None or seljet is None:
+        base = seljet.pt if (seljet is not None and hasattr(seljet, "pt")) else ak.Array([])
+        ones = ak.full_like(base, 1.0, dtype=float)
+        return ones, ones, ones
+
+    # Apply only to light jets
+    if hasattr(seljet, "flav"):
+        flav = seljet.flav
+        is_light = (flav == 0) | (flav == 1) | (flav == 21)
+    else:
+        is_light = ak.ones_like(seljet.pt, dtype=bool)
+
+    abs_pdg = np.abs(genpart.pdgId)
+
+    # dR matching
+    drs = genpart.metric_table(seljet)
+    in_cone = ak.all(drs < dr, axis=2)
+
+    # V0 candidates
+    is_k0s = (abs_pdg == 310)
+    is_lambda = (abs_pdg == 3122)
+
+    has_k0s = ak.any(in_cone & is_k0s, axis=1)
+    has_lambda = ak.any(in_cone & is_lambda, axis=1)
+
+    nominal = ak.full_like(seljet.pt, 1.0, dtype=float)
+    up = ak.full_like(seljet.pt, 1.0, dtype=float)
+
+    up = ak.where(is_light & has_k0s, up * 1.3, up)
+    up = ak.where(is_light & has_lambda, up * 1.5, up)
+
+    # Symmetric down variation
+    safe_up = ak.where(up == 0.0, ak.ones_like(up), up)
+    down = 1.0 / safe_up
+
+    return nominal, up, down
+
 class NanoProcessor(processor.ProcessorABC):
     def __init__(
         self,
@@ -237,6 +640,14 @@ class NanoProcessor(processor.ProcessorABC):
 
     ## Processed events per-chunk, made selections, filled histogram, stored root files
     def process_shift(self, events, shift_name):
+
+        # --- VETO PROBLEMATIC RUNS ---
+        # Remove events belonging to runs that are not covered in the prescale JSON files
+        bad_runs = {380126, 380127, 380128, 380238}
+        mask_run = ~ak.Array([r in bad_runs for r in events.run])
+        events = events[mask_run]
+
+
         dataset = events.metadata["dataset"]
         isRealData = not hasattr(events, "genWeight")
         ######################
@@ -351,9 +762,10 @@ class NanoProcessor(processor.ProcessorABC):
         ####################
         # Selected objects # : Pruned objects with reduced event_level
         ####################
+
         # Keep the structure of events and pruned the object size
         pruned_ev = events[event_level]
-        #print(pruned_ev.fields)
+      
  
         # Leading matched jet
         if ak.any(ak.num(matching_jets[event_level]) > 0):
@@ -408,7 +820,91 @@ class NanoProcessor(processor.ProcessorABC):
         ####################
         # Configure SFs - read pruned objects from the pruned_ev and apply SFs and call the systematics
         #logger.debug("setting up weight_manager")
+
+        
+        
         weights = weight_manager(pruned_ev, self.SF_map, self.isSyst)
+
+        # ------------------------------------------------------------------
+        # Systematic uncertainties (MC only)
+        #   - gluonSplitting
+        #   - bfragmentation
+        #   - Bdecay
+        #   - cfragmentation
+        #   - cdfragmentation
+        #   - V0
+        # ------------------------------------------------------------------
+        if (not isRealData) and hasattr(pruned_ev, "GenPart") and hasattr(pruned_ev, "GenJet") and hasattr(pruned_ev, "SelJet"):
+
+            # Identify heavy-flavor hadrons using PDG ID encoding
+            is_heavy_hadron = lambda p, pid: (abs(p.pdgId) // 100 == pid) | (abs(p.pdgId) // 1000 == pid)
+
+            # Select B hadrons that are final-state copies and geometrically matched to the selected jet
+            sel_bhadrons = (
+                is_heavy_hadron(pruned_ev.GenPart, 5)
+                & pruned_ev.GenPart.hasFlags("isLastCopy")
+                & (ak.all(pruned_ev.GenPart.metric_table(pruned_ev.SelJet) < 0.5, axis=2))
+            )
+            bhadrons = pruned_ev.GenPart[sel_bhadrons]
+
+            # Build a B-hadron collection and remove hadrons with B daughters
+            BHadron = ak.zip(
+                {
+                    "pT": bhadrons.pt,
+                    "eta": bhadrons.eta,
+                    "phi": bhadrons.phi,
+                    "pdgID": bhadrons.pdgId,
+                    "mass": get_hadron_mass(bhadrons.pdgId),
+                    "hasBdaughter": ak.values_astype(
+                        ak.any(is_heavy_hadron(bhadrons.children, 5), axis=-1), int
+                    ),
+                }
+            )
+            lastBHadron = BHadron[BHadron.hasBdaughter == 0]
+
+            # 1) gluon splitting
+            n_lastB = ak.num(lastBHadron)
+            gsp_nom, gsp_up, gsp_down = get_gluonsplitting_weight_from_lastB(lastBHadron, pruned_ev.SelJet.pt)
+            weights.add("gluonSplitting", gsp_nom, gsp_up, gsp_down)
+
+            # 2) b fragmentation:
+            genJetPt = ak.values_astype(
+                ak.sum(pruned_ev.GenJet.pt * ak.all(pruned_ev.GenJet.metric_table(pruned_ev.SelJet) < 0.5, axis=2), axis=-1),
+                float,
+            )
+
+            # Fraction of jet pT carried by the heaviest B hadron
+            max_mass = ak.max(BHadron.mass, axis=-1)
+            xB = ak.values_astype(
+                (ak.num(BHadron) > 0) * ak.sum(BHadron.pT * (BHadron.mass == max_mass) / genJetPt, axis=-1),
+                float,
+            )
+
+            bfrag_nom, bfrag_up, bfrag_down = get_bfragmentation_weight(xB, genJetPt)
+            weights.add("bfragmentation", bfrag_nom, bfrag_up, bfrag_down)
+
+            # 3) B-hadron decay (semi-leptonic BR) uncertainty
+            bHadronId = ak.values_astype(
+                -1 * (ak.num(lastBHadron) != 1)
+                + (ak.num(lastBHadron) == 1) * ak.sum(lastBHadron.pdgID, axis=-1),
+                float,
+            )
+
+            bdecay_nom, bdecay_up, bdecay_down = get_decay_weight(bHadronId)
+            weights.add("bdecay", bdecay_nom, bdecay_up, bdecay_down)
+
+            # 4) c fragmentation
+            cfrag_nom, cfrag_up, cfrag_down = get_cfragmentation_weight(pruned_ev.GenPart, pruned_ev.SelJet)
+            weights.add("cfragmentation", cfrag_nom, cfrag_up, cfrag_down)
+
+            # 5) c->D (semi-muonic) fragmentation/decay uncertainty (no ancestry check)
+            cd_nom, cd_up, cd_down = get_cdfragmentation_simple_weight(pruned_ev.GenPart, pruned_ev.SelJet)
+            weights.add("cdfragmentation_simple", cd_nom, cd_up, cd_down)
+
+            # 6) V0 (K0s / Lambda) systematic
+            v0_nom, v0_up, v0_down = get_v0_weight(pruned_ev.GenPart, pruned_ev.SelJet)
+            weights.add("v0", v0_nom, v0_up, v0_down)
+
         if isRealData:
             if self._year == "2022":
                 run_num = "355374_362760"
