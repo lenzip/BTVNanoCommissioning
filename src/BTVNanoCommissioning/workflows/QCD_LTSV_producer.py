@@ -911,23 +911,46 @@ class NanoProcessor(processor.ProcessorABC):
             elif self._year == "2023":
                 run_num = "366727_370790"
             elif self._year == "2024":
-                run_num = "378985_386951"    
+                run_num = "378985_386951"
+            else:
+                raise ValueError(f"Unsupported year {self._year} for prescales")
 
-            psweight = np.zeros(len(pruned_ev))
-            for trigger, trigbool in trigbools.items():
-                psfile = f"src/BTVNanoCommissioning/data/Prescales/ps_weight_{trigger}_run{run_num}.json"
+            # Decide one trigger per event based on SelJet.pt bin
+            jet_pt = pruned_ev.SelJet.pt
+
+            # build exclusive masks per trigger bin
+            psweight = ak.zeros_like(jet_pt, dtype=np.float32)
+
+            for _, cfg in pt_matrix.items():
+                trig = cfg["trigger"]
+                psfile = f"src/BTVNanoCommissioning/data/Prescales/ps_weight_{trig}_run{run_num}.json"
                 if not os.path.isfile(psfile):
                     raise NotImplementedError(
-                        f"Prescale weights not available for {trigger} in {self._year}. Please run `scripts/dump_prescale.py`."
+                        f"Prescale weights not available for {trig} in {self._year}. "
+                        "Please run `scripts/dump_prescale.py`."
                     )
+
+                in_pt_bin = (jet_pt >= cfg["ptmin"]) & (jet_pt < cfg["ptmax"])
+
+                # require the trigger to have fired in the event (on pruned_ev!)
+                fired = HLT_helper(pruned_ev, [trig])
+
+                use = in_pt_bin & fired
+
                 pseval = correctionlib.CorrectionSet.from_file(psfile)
-                thispsweight = pseval["prescaleWeight"].evaluate(
+                thisps = pseval["prescaleWeight"].evaluate(
                     pruned_ev.run,
-                    f"HLT_{trigger}",
+                    f"HLT_{trig}",
                     ak.values_astype(pruned_ev.luminosityBlock, np.float32),
                 )
-                psweight = ak.where(trigbool[event_level], thispsweight, psweight)
-            weights.add("psweight", psweight)
+
+                # add contribution only where this trigger is the chosen one
+                psweight = ak.where(use, thisps, psweight)
+
+            weights.add("psweight", ak.values_astype(psweight, float))
+        if isRealData:
+            frac0 = ak.mean(psweight == 0)
+            print("psweight: min/max =", ak.min(psweight), ak.max(psweight), " frac==0 =", frac0)
         # Configure systematics shifts
         if shift_name is None:
             systematics = ["nominal"] + list(
@@ -935,6 +958,7 @@ class NanoProcessor(processor.ProcessorABC):
             )  # nominal + weight variation systematics
         else:
             systematics = [shift_name]  # JES/JER systematics
+ 
 
         # Fill the weight to output arrys
 
