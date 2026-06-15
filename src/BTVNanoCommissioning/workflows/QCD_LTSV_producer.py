@@ -69,7 +69,7 @@ def define_histograms(
 
     for obj, attrs in particle_objects.items():
         for attr in attrs:
-            if obj == "SelJet":
+            if obj == "MatchedJets":
                 for tagger in tagger_list:
                     # syst, flav, ptbin, attr
                     HISTOGRAM_AXES[f"{tagger}_btagwp_axis"] = hist.axis.IntCategory([0, 1, 2, 3, 4, 5], name=f"{tagger}_btagwp", label=f"{tagger} WP passed")
@@ -601,6 +601,11 @@ class NanoProcessor(processor.ProcessorABC):
         ## Load corrections
         self.SF_map = load_SF(self._year, self._campaign)
 
+        # Remove SF mu_Iso from the SF dictionary
+        for key in list(self.SF_map.keys()):
+            if "mu_Iso" in key:
+                self.SF_map.pop(key)
+
         # WP per tagger
         self.btag_wps = btag_wp_dict[self._year + "_" + self._campaign] 
 
@@ -618,7 +623,8 @@ class NanoProcessor(processor.ProcessorABC):
 
 
         self.particle_objects = {
-            "SelJet": ["pt", "eta", "phi", "mass", "DeepJet_sv_mass_0", "Proba"],
+            # "SelJet": ["pt", "eta", "phi", "mass", "DeepJet_sv_mass_0", "Proba"],
+            "MatchedJets": ["pt", "eta", "phi", "mass", "DeepJet_sv_mass_0", "Proba"],
             "SelMuon": ["pt", "eta", "phi"],  
             "PuppiMET": ["pt", "phi"],        
         }
@@ -691,7 +697,12 @@ class NanoProcessor(processor.ProcessorABC):
         ## Muon cuts
         # muon twiki: https://twiki.cern.ch/twiki/bin/view/CMS/SWGuideMuonIdRun2
 
-        muon_sel = (events.Muon.pt > 5) & (mu_idiso(events, self._campaign))
+        # muon_sel = (events.Muon.pt > 5) & (mu_idiso(events, self._campaign))
+        muon_sel = (
+                    (events.Muon.pt > 5)
+                    & (abs(events.Muon.eta) < 2.4)
+                    & (events.Muon.tightId > 0.5)
+                    )
         event_mu = events.Muon[muon_sel]
         req_muon = ak.num(event_mu.pt) >= 1
 
@@ -771,6 +782,7 @@ class NanoProcessor(processor.ProcessorABC):
         if ak.any(ak.num(matching_jets[event_level]) > 0):
             leading_jet = matching_jets[event_level][:, 0]
             pruned_ev["SelJet"] = leading_jet
+            pruned_ev["MatchedJets"] = matching_jets[event_level] # all matched jets
             # print(leading_jet.fields)
 
             # Flavour tagging
