@@ -131,50 +131,73 @@ def fill_histograms(
                     attr_value = getattr(pruned_ev[_obj], attr)
 
 
-                # flatten if needed
-                if attr_value.ndim > 1:
-                    weight_flat, attr_value_flat = broadcast_and_flatten(weight, attr_value)
-                else:
-                    weight_flat = weight
-                    attr_value_flat = attr_value
+                if obj == "MatchedJets":
+                    jet_pt = pruned_ev.MatchedJets.pt
 
-
-                if obj == "SelJet":
-                    flav_flat = ak.flatten(pruned_ev.SelJet.flav, axis=None)
-                    jet_pt = pruned_ev.SelJet.pt
-                    
-                    # Build pt bins
-                    ptbins = ak.Array(["undefined"] * len(jet_pt))
+                    ptbins = ak.Array([["undefined"] * n for n in ak.to_list(ak.num(jet_pt))])
                     for name, info in jetPtBins.items():
                         low, high = info["jetPtRange"]
                         mask = (jet_pt >= low) & (jet_pt < high)
                         ptbins = ak.where(mask, name, ptbins)
-                    # Flatten pt bins
-                    ptbins_flat = ak.to_list(ptbins)
 
-
-                    for tagger in tagger_list: 
-                        bdisc = getattr(pruned_ev.SelJet, f"btag{tagger}B")  # per ora con b vs all
+                    for tagger in tagger_list:
+                        bdisc = getattr(pruned_ev.MatchedJets, f"btag{tagger}B")
                         wps = btag_wps[tagger]["b"]
 
-                        
                         pass_wp_idx = ak.zeros_like(bdisc, dtype=int)
                         for wp_name, wp_thr in wps.items():
+
                             if wp_name == "No":
                                 continue
                             pass_wp_idx = pass_wp_idx + ak.values_astype(bdisc > float(wp_thr), int)
 
+                        # Broadcast everything against attr_value to guarantee matching lengths
+                        weight_b = ak.broadcast_arrays(weight, attr_value)[0]
+
+                        attr_b = attr_value
+                        flav_b = pruned_ev.MatchedJets.flav
+                        ptbin_b = ptbins
+                        wp_b = pass_wp_idx
+
+                        weight_flat = ak.to_numpy(ak.flatten(weight_b, axis=1))
+                        attr_value_flat = ak.to_numpy(ak.flatten(attr_b, axis=1))
+                        flav_flat = ak.to_numpy(ak.flatten(flav_b, axis=1))
+                        ptbins_flat = ak.to_list(ak.flatten(ptbin_b, axis=1))
+                        pass_wp_idx_flat = ak.to_numpy(ak.flatten(wp_b, axis=1))
+
+                        nfill = len(ptbins_flat)
+
+                        print(type(ptbins))
+                        print(ptbins[:5])
+                        print(ak.type(ptbins))
+
+                        print(
+                            "lengths",
+                            len(weight_flat),
+                            len(attr_value_flat),
+                            len(flav_flat),
+                            len(ptbins_flat),
+                            len(pass_wp_idx_flat),
+                        )
+
                         histograms[f"{obj}_{tagger}_{attr}"].fill(
-                            syst=syst,
+                            syst=[syst] * nfill,
                             ptbin=ptbins_flat,
                             **{attr: attr_value_flat},
                             flav=flav_flat,
-                            **{f"{tagger}_btagwp": pass_wp_idx},
+                            **{f"{tagger}_btagwp": pass_wp_idx_flat},
                             weight=weight_flat,
                         )
                 else:
-                    histograms[f"{obj}_{attr}"].fill(**{attr: attr_value_flat, "weight": weight_flat, "syst": syst})
+                    if attr_value.ndim > 1:
+                        weight_b, attr_b = ak.broadcast_arrays(weight, attr_value)
+                        weight_flat = ak.flatten(weight_b, axis=None)
+                        attr_value_flat = ak.flatten(attr_b, axis=None)
+                    else:
+                        weight_flat = weight
+                        attr_value_flat = attr_value
 
+                    histograms[f"{obj}_{attr}"].fill(**{attr: attr_value_flat, "weight": weight_flat, "syst": syst})
 
     return histograms
 
@@ -812,6 +835,21 @@ class NanoProcessor(processor.ProcessorABC):
 
             pruned_ev["SelJet"] = ak.with_field(pruned_ev["SelJet"], genflavor, "flav")
 
+        # all matched jets
+        if "hadronFlavour" in matching_jets[event_level].fields:
+            matched_genflavor = ak.values_astype(
+                matching_jets[event_level].hadronFlavour
+                + 1 * (
+                    (matching_jets[event_level].partonFlavour == 0)
+                    & (matching_jets[event_level].hadronFlavour == 0)
+                ),
+                int,
+            )
+        else:
+            matched_genflavor = ak.zeros_like(matching_jets[event_level].pt, dtype=int)
+
+        pruned_ev["MatchedJets"] = ak.with_field(pruned_ev["MatchedJets"], matched_genflavor,  "flav")
+
 
         # Leading muon
         if ak.any(ak.num(event_mu[event_level]) > 0):
@@ -951,9 +989,9 @@ class NanoProcessor(processor.ProcessorABC):
 
                 pseval = correctionlib.CorrectionSet.from_file(psfile)
                 thisps = pseval["prescaleWeight"].evaluate(
-                    pruned_ev.run,
+                    np.asarray(pruned_ev.run),
                     f"HLT_{trig}",
-                    ak.values_astype(pruned_ev.luminosityBlock, np.float32),
+                    np.asarray(ak.values_astype(pruned_ev.luminosityBlock, np.float32)),
                 )
 
                 # add contribution only where this trigger is the chosen one
